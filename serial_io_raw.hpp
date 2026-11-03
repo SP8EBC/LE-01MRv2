@@ -3,22 +3,31 @@
 
 #include "serial/serial.h"
 #include "serial_io_interface.h"
+#include <chrono>
+#include <span>
 #include <string>
 
+/**
+ * Modbus-RTU master implemented directly on top of the serial port, without libmodbus.
+ */
 class SerialIoRaw : public SerialIoIf {
   public:
-	SerialIoRaw (std::string &portName, int modbusRtsDelay, bool modbusSerialMode485,
-				 uint8_t rawSkipBytes, bool rawSkipZeros);
+	SerialIoRaw (const SerialSettings &settings, uint8_t rawSkipBytes, bool rawSkipZeros,
+				 std::chrono::milliseconds responseTimeout);
 
-	virtual void requestRegisters (uint16_t slaveid, uint16_t startregister, uint8_t num,
-								   std::array<uint16_t, 16> &out);
+	std::vector<uint16_t> readHoldingRegisters (uint8_t slaveId, uint16_t startRegister,
+												uint16_t count) override;
+
+	std::string description () const override;
 
   private:
-	std::string m_portName;
-	int m_modbusRtuDelay;
-	bool m_modbusSerialMode485;
+	void ensureOpen ();
+	void transmit (std::span<const uint8_t> frame);
+
+	SerialSettings m_settings;
 	uint8_t m_rawSkipBytes;
 	bool m_rawSkipZeros;
+	std::chrono::milliseconds m_responseTimeout;
 	serial::Serial m_rawSerialPort;
 };
 

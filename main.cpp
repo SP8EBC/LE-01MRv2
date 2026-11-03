@@ -1,290 +1,496 @@
 #include <boost/program_options.hpp>
-#include <cerrno>
+#include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <iostream>
-#include <modbus.h>
+#include <memory>
+#include <optional>
 #include <string>
+#include <thread>
 
-#include "raw_mode.hpp"
+#include "console_ui.hpp"
+#include "csv_writer.hpp"
+#include "le01mr.hpp"
+#include "serial_io_libmodbus.hpp"
 #include "serial_io_raw.hpp"
 
 #pragma push_macro("U")
 #undef U
 // pragma required as a workaround of possible conflict with cpprestsdk.
 // more info here: https://github.com/fmtlib/fmt/issues/3330
-#include "spdlog/fmt/bin_to_hex.h"
+#include "spdlog/sinks/basic_file_sink.h"
+#include "spdlog/sinks/dist_sink.h"
+#include "spdlog/sinks/ringbuffer_sink.h"
 #include "spdlog/sinks/stdout_color_sinks.h"
 #include "spdlog/spdlog.h"
 #pragma pop_macro("U")
 
-// clang-format off
-/*
- * Modbus register map of Electrical energy meter LE-01MR v2
- *
- * 0x03 - Read Holding Registers
- * Data reading, according to Modbus RTU protocol, is carried out using
- * the Read Holding Register command (command code 0x03).
- *
- * +-----+---------------------------------------------+----------+----------+-----+------+-------+-------+---------------------+
- * | Lp. | Parameter                                   | Addr HEX | Addr DEC | R/W | Regs | Type  | Unit  | Scale (reg -> phys) |
- * +=====+=============================================+==========+==========+=====+======+=======+=======+=====================+
- * |   1 | Voltage                                     | 0x100    |      256 | R   |    2 | INT32 | V     |               0.001 |
- * |   2 | Current                                     | 0x102    |      258 | R   |    2 | INT32 | A     |               0.001 |
- * |   3 | Active Power                                | 0x104    |      260 | R   |    2 | INT32 | W     |                   1 |
- * |   4 | Apparent Power                              | 0x106    |      262 | R   |    2 | INT32 | VA    |                   1 |
- * |   5 | Reactive Power                              | 0x108    |      264 | R   |    2 | INT32 | Var   |                   1 |
- * |   6 | Frequency                                   | 0x10A    |      266 | R   |    1 | INT16 | Hz    |                 0.1 |
- * |   7 | Power factor                                | 0x10B    |      267 | R   |    1 | INT16 | -     |               0.001 |
- * |   8 | Total consumed (imported) active energy     | 0x10E    |      270 | R   |    2 | INT32 | kWh   |                0.01 |
- * |   9 | Total returned (exported) active energy     | 0x118    |      280 | R   |    2 | INT32 | kWh   |                0.01 |
- * |  10 | Total active energy                         | 0x122    |      290 | R   |    2 | INT32 | kWh   |                0.01 |
- * |  11 | Total consumed (imported) reactive energy   | 0x12C    |      300 | R   |    2 | INT32 | kvarh |                0.01 |
- * |  12 | Total returned (exported) reactive energy   | 0x136    |      310 | R   |    2 | INT32 | kvarh |                0.01 |
- * |  13 | Total reactive energy                       | 0x140    |      320 | R   |    2 | INT32 | kvarh |                0.01 |
- * |  14 | Total reactive energy in the first quadrant | 0x14A    |      330 | R   |    2 | INT32 | kvarh |                0.01 |
- * |  15 | Total reactive energy in the second quad    | 0x154    |      340 | R   |    2 | INT32 | kvarh |                0.01 |
- * |  16 | Total reactive energy in the third quad     | 0x15E    |      350 | R   |    2 | INT32 | kvarh |                0.01 |
- * |  17 | Total reactive energy in the fourth quad    | 0x168    |      360 | R   |    2 | INT32 | kvarh |                0.01 |
- * |  18 | Resettable auxiliary active energy meter    | 0x172    |      370 | R   |    2 | INT32 | kWh   |                0.01 |
- * |  19 | Resettable auxiliary reactive energy meter  | 0x174    |      372 | R   |    2 | INT32 | kvarh |                0.01 |
- * |  20 | Consumed (imported) active power demand     | 0x176    |      374 | R   |    2 | INT32 | W     |                 0.1 |
- * +-----+---------------------------------------------+----------+----------+-----+------+-------+-------+---------------------+
- *
- * 0x06 - Write Single Register
- *
- * +------------------------------+----------+----------+-----+------+
- * | Parameter                    | Addr HEX | Addr DEC | R/W | Regs |
- * +==============================+==========+==========+=====+======+
- * | Auxiliary energy meter reset | 0x2002   |     8194 | R/W |    1 |
- * +------------------------------+----------+----------+-----+------+
- *
- * Values to write:
- *
- * +--------+----------------------------------------+
- * | Value  | Action                                 |
- * +========+========================================+
- * | 0x2000 | Active energy meter reset              |
- * | 0x4000 | Reactive energy meter reset            |
- * | 0x6000 | Active and reactive energy meter reset |
- * +--------+----------------------------------------+
- */
-// clang-format on
+// The Modbus register map of LE-01MR v2 is described in le01mr.hpp
 
-//!< serial port to use for communication with Modbus-RTU slave
-std::string portName;
+namespace {
 
-//!< Where to store output file with weather frame
-std::string outputFileName;
+volatile std::sig_atomic_t stopRequested = 0;
 
-//!< a delay in microseconds between setting RTS line and starting transmission
-int modbusSetRtsDelay = 50000;
+void onSignal (int) { stopRequested = 1; }
 
-//!< RTS line state while it is set to active
-int modbusSetRtuMode = MODBUS_RTU_RTS_UP;
-
-//!< If true will set modbus_rtu_set_serial_mode to MODBUS_RTU_RS485, otherwise to MODBUS_RTU_RS232
-bool modbusSetSerialMode485 = false;
-
-bool rawModeEnabled = false;
-
-uint8_t rawSkipBytes = 0;
-
-bool rawSkipZeros = false;
-
-void parseArgs (int argc, char *argv[])
+void installSignalHandlers ()
 {
-	boost::program_options::options_description optionsDescription ("");
+	struct sigaction action{};
+	action.sa_handler = onSignal;
+	sigemptyset (&action.sa_mask);
+	action.sa_flags = 0; // no SA_RESTART, blocking calls are interrupted so we quit quickly
+
+	sigaction (SIGINT, &action, nullptr);
+	sigaction (SIGTERM, &action, nullptr);
+	sigaction (SIGHUP, &action, nullptr); // SSH session closed
+}
+
+struct AppConfig {
+	SerialSettings serial;
+	unsigned slaveId = 1;
+
+	bool rawModeEnabled = false;
+	uint8_t rawSkipBytes = 0;
+	bool rawSkipZeros = false;
+
+	std::string outputFileName;
+	double intervalS = 1.0;
+	unsigned timeoutMs = 1000;
+	le01mr::ReadMode readMode = le01mr::ReadMode::Auto;
+	unsigned maxRegisters = le01mr::DEFAULT_MAX_REGISTERS;
+	bool swapWords = false;
+
+	bool noUi = false;
+	bool verbose = false;
+	bool modbusDebug = false;
+	std::string logFile;
+
+	double maxCurrentA = 32.0;
+	double maxPowerW = 0.0; //!< 0 - calculated from maxCurrentA
+};
+
+[[noreturn]] void exitWithUsage (const boost::program_options::options_description &options,
+								 const std::string &error, int code)
+{
+	if (!error.empty ()) {
+		SPDLOG_ERROR ("{}", error);
+	}
+	std::cout << "Usage: le-01mr --port /dev/ttyUSB0 [options]" << std::endl
+			  << options << std::endl;
+	exit (code);
+}
+
+AppConfig parseArgs (int argc, char *argv[])
+{
+	namespace po = boost::program_options;
+
+	AppConfig config;
+	std::string parity = "N";
+	std::string readMode = "auto";
+	unsigned rawSkipBytes = 0;
 
 	// ----------------
 	// GENERAL OPTIONS
 	// ----------------
-	boost::program_options::options_description generalOptions ("General Options");
-	boost::program_options::options_description_easy_init port = generalOptions.add_options ();
-	port ("port,P",
-		  boost::program_options::value<std::string> (&portName),
-		  " : Serial port used for communication");
-	boost::program_options::options_description_easy_init mode485 = generalOptions.add_options ();
-	mode485 ("mode-485,4", " : Set to use  MODBUS_RTU_RS485 instead of _RS232 ");
-	boost::program_options::options_description_easy_init raw = generalOptions.add_options ();
-	raw ("raw,R", " : use low level function for communication ");
-	boost::program_options::options_description_easy_init output = generalOptions.add_options ();
-	output ("out,O",
-			boost::program_options::value<std::string> (&outputFileName),
-			" : Path to output CSV file");
-	optionsDescription.add (generalOptions);
+	po::options_description generalOptions ("General Options");
+	generalOptions.add_options () ("help,h", " : Show this help");
+	generalOptions.add_options () ("port,P",
+								   po::value<std::string> (&config.serial.port),
+								   " : Serial port used for communication");
+	generalOptions.add_options () ("slave,s",
+								   po::value<unsigned> (&config.slaveId)->default_value (1),
+								   " : Modbus slave address of the meter");
+	generalOptions.add_options () ("baud,b",
+								   po::value<int> (&config.serial.baudrate)->default_value (9600),
+								   " : Baudrate");
+	generalOptions.add_options () ("parity",
+								   po::value<std::string> (&parity)->default_value ("N"),
+								   " : Parity: N, E or O");
+	generalOptions.add_options () ("stop-bits",
+								   po::value<int> (&config.serial.stopBits)->default_value (1),
+								   " : Number of stop bits: 1 or 2");
+	generalOptions.add_options () ("mode-485,4", " : Set to use MODBUS_RTU_RS485 instead of _RS232");
+	generalOptions.add_options () ("raw,R", " : Use low level functions for communication");
+	generalOptions.add_options () ("out,O",
+								   po::value<std::string> (&config.outputFileName),
+								   " : Path to output CSV file. Data are appended to an existing "
+								   "file. By default le01mr_YYYYmmdd_HHMMSS.csv is created");
+	generalOptions.add_options () (
+		"interval,i",
+		po::value<double> (&config.intervalS)->default_value (1.0),
+		" : Interval between readings in seconds");
+	generalOptions.add_options () (
+		"timeout,t",
+		po::value<unsigned> (&config.timeoutMs)->default_value (1000),
+		" : Response timeout in milliseconds");
+	generalOptions.add_options () (
+		"read-mode",
+		po::value<std::string> (&readMode)->default_value ("auto"),
+		" : How registers are requested: 'block' - as few requests as possible (limited by "
+		"--max-registers), spanning over unmapped registers, 'grouped' - one request per "
+		"contiguous group of registers (12 requests), 'auto' - try 'block' first and switch to "
+		"'grouped' if the meter rejects it");
+	generalOptions.add_options () (
+		"max-registers",
+		po::value<unsigned> (&config.maxRegisters)->default_value (le01mr::DEFAULT_MAX_REGISTERS),
+		" : Maximum number of registers read with a single request in 'block' mode, 2..125. "
+		"LE-01MR v2 accepts up to 100");
+	generalOptions.add_options () ("swap-words",
+								   " : 32 bit values are sent low word first (default: high word "
+								   "first)");
+
+	// ----------------
+	// DISPLAY OPTIONS
+	// ----------------
+	po::options_description displayOptions ("Display Options");
+	displayOptions.add_options () ("no-ui",
+								   " : Don't use full screen console UI, print readings line by "
+								   "line instead. Used automatically if output isn't a terminal");
+	displayOptions.add_options () (
+		"max-current",
+		po::value<double> (&config.maxCurrentA)->default_value (32.0),
+		" : Full scale of the current bar graph [A]");
+	displayOptions.add_options () ("max-power",
+								   po::value<double> (&config.maxPowerW),
+								   " : Full scale of power bar graphs [W]. By default: 230 V * "
+								   "max-current");
+	displayOptions.add_options () ("verbose,v", " : Show debug messages");
+	displayOptions.add_options () ("log-file",
+								   po::value<std::string> (&config.logFile),
+								   " : Additionally store all messages in this file");
+	displayOptions.add_options () ("modbus-debug",
+								   " : Enable libmodbus debug output (only with --no-ui)");
 
 	// -----------------
 	// RTS OPTIONS
 	// -----------------
-	boost::program_options::options_description rtsOptions ("RTS line Options");
-	boost::program_options::options_description_easy_init rtsDelay = rtsOptions.add_options ();
-	rtsDelay ("rts-delay",
-			  boost::program_options::value<int> (&modbusSetRtsDelay),
-			  " : Delay in microseconds between setting RTS line and starting transmission. By "
-			  "default: 50,000");
-	boost::program_options::options_description_easy_init rtsMode = rtsOptions.add_options ();
-	rtsDelay (
+	po::options_description rtsOptions ("RTS line Options");
+	rtsOptions.add_options () (
+		"rts-delay",
+		po::value<int> (&config.serial.rtsDelayUs),
+		" : Delay in microseconds between setting RTS line and starting transmission. By "
+		"default: 50,000");
+	rtsOptions.add_options () (
 		"rts-mode",
-		boost::program_options::value<int> (&modbusSetRtuMode),
+		po::value<int> (&config.serial.rtsMode),
 		" : State of RTS line in active state: 0 - don't toggle, 1 - RTS_UP, 2 - RTS_DOWN. By "
 		"default: RTS_UP");
-
-	optionsDescription.add (rtsOptions);
 
 	// -----------------
 	// RAW MODE OPTIONS
 	// -----------------
-	boost::program_options::options_description rawOptions ("Raw Mode Options");
-	boost::program_options::options_description_easy_init skipZeros = rawOptions.add_options ();
-	skipZeros ("raw-skip-zeros",
-			   " : Skips all preceding zeros before first non-zero byte of a response.");
-	boost::program_options::options_description_easy_init skipBytes = rawOptions.add_options ();
-	skipBytes ("raw-skip-bytes",
-			   boost::program_options::value<uint8_t> (&rawSkipBytes),
-			   " : Skips specified number of bytes from the begining of a response.");
+	po::options_description rawOptions ("Raw Mode Options");
+	rawOptions.add_options () (
+		"raw-skip-zeros",
+		" : Skips all preceding zeros before first non-zero byte of a response.");
+	rawOptions.add_options () ("raw-skip-bytes",
+							   po::value<unsigned> (&rawSkipBytes),
+							   " : Skips specified number of bytes from the begining of a response.");
 
-	optionsDescription.add (rawOptions);
+	po::options_description optionsDescription ("");
+	optionsDescription.add (generalOptions).add (displayOptions).add (rtsOptions).add (rawOptions);
 
 	// PARSING
-	boost::program_options::variables_map odVariablesMap;
+	po::variables_map vm;
 	try {
-		boost::program_options::store (
-			boost::program_options::parse_command_line (argc, argv, optionsDescription),
-			odVariablesMap);
-		boost::program_options::notify (odVariablesMap);
+		po::store (po::parse_command_line (argc, argv, optionsDescription), vm);
+		po::notify (vm);
 	}
-	catch (boost::wrapexcept<boost::program_options::unknown_option> &ex) {
-		SPDLOG_ERROR ("Missing or wrong parameter!");
-		std::cout << ex.what () << std::endl << optionsDescription << std::endl;
-		exit (-2);
+	catch (const po::error &ex) {
+		exitWithUsage (optionsDescription, std::string ("Missing or wrong parameter! ") + ex.what (), -2);
 	}
 
-	if (portName.size () == 0) {
-		SPDLOG_ERROR ("Serial port not specified!");
-		std::cout << optionsDescription << std::endl;
-		exit (-3);
+	if (vm.count ("help")) {
+		exitWithUsage (optionsDescription, "", 0);
 	}
 
-	if (odVariablesMap.count ("mode-485")) {
-		modbusSetSerialMode485 = true;
+	if (config.serial.port.empty ()) {
+		exitWithUsage (optionsDescription, "Serial port not specified!", -3);
 	}
 
-	if (odVariablesMap.count ("raw")) {
-		rawModeEnabled = true;
+	if (config.slaveId < 1 || config.slaveId > 247) {
+		exitWithUsage (optionsDescription, "Slave address must be in range 1..247", -2);
 	}
 
-	if (odVariablesMap.count ("raw-skip-zeros")) {
-		if (rawSkipBytes > 0) {
-			SPDLOG_ERROR (
-				"Conflicting settings! Cannot use raw-skip-zeros and raw-skip-bytes together");
+	if (parity.size () != 1 || std::string ("NEO").find (std::toupper (parity[0])) == std::string::npos) {
+		exitWithUsage (optionsDescription, "Parity must be N, E or O", -2);
+	}
+	config.serial.parity = static_cast<char> (std::toupper (parity[0]));
+
+	if (config.serial.stopBits != 1 && config.serial.stopBits != 2) {
+		exitWithUsage (optionsDescription, "Number of stop bits must be 1 or 2", -2);
+	}
+
+	if (config.intervalS < 0.1) {
+		exitWithUsage (optionsDescription, "Interval must be at least 0.1 s", -2);
+	}
+
+	if (readMode == "auto") {
+		config.readMode = le01mr::ReadMode::Auto;
+	}
+	else if (readMode == "block") {
+		config.readMode = le01mr::ReadMode::Block;
+	}
+	else if (readMode == "grouped") {
+		config.readMode = le01mr::ReadMode::Grouped;
+	}
+	else {
+		exitWithUsage (optionsDescription, "Read mode must be one of: auto, block, grouped", -2);
+	}
+
+	if (config.maxRegisters < 2 || config.maxRegisters > 125) {
+		exitWithUsage (optionsDescription, "max-registers must be in range 2..125", -2);
+	}
+
+	if (config.maxCurrentA <= 0.0 || (vm.count ("max-power") && config.maxPowerW <= 0.0)) {
+		exitWithUsage (optionsDescription, "Bar graph full scale must be positive", -2);
+	}
+	if (config.maxPowerW <= 0.0) {
+		config.maxPowerW = 230.0 * config.maxCurrentA;
+	}
+
+	config.serial.rs485 = vm.count ("mode-485") > 0;
+	config.rawModeEnabled = vm.count ("raw") > 0;
+	config.swapWords = vm.count ("swap-words") > 0;
+	config.noUi = vm.count ("no-ui") > 0;
+	config.verbose = vm.count ("verbose") > 0;
+	config.modbusDebug = vm.count ("modbus-debug") > 0;
+
+	if (rawSkipBytes > 255) {
+		exitWithUsage (optionsDescription, "raw-skip-bytes must be in range 0..255", -2);
+	}
+	config.rawSkipBytes = static_cast<uint8_t> (rawSkipBytes);
+
+	if (vm.count ("raw-skip-zeros")) {
+		if (config.rawSkipBytes > 0) {
+			SPDLOG_ERROR ("Conflicting settings! Cannot use raw-skip-zeros and raw-skip-bytes together");
 			exit (-4);
 		}
+		config.rawSkipZeros = true;
+	}
+
+	return config;
+}
+
+//! One line summary of a reading, used when the full screen UI is not active
+void printReading (const le01mr::Reading &reading)
+{
+	static constexpr std::array<const char *, le01mr::PARAM_COUNT> symbols = {
+		"U", "I", "P", "S", "Q", "f", "PF", "E+", "E-", "E", "Eq+", "Eq-", "Eq",
+		"Eq1", "Eq2", "Eq3", "Eq4", "Eaux", "Eqaux", "Pdem"};
+	static constexpr std::array<size_t, 9> shown = {le01mr::Voltage,
+													le01mr::Current,
+													le01mr::ActivePower,
+													le01mr::ApparentPower,
+													le01mr::ReactivePower,
+													le01mr::Frequency,
+													le01mr::PowerFactor,
+													le01mr::ImportedActiveEnergy,
+													le01mr::ExportedActiveEnergy};
+
+	std::string line = CsvWriter::formatLocalTime (reading.timestamp);
+	for (const size_t i : shown) {
+		const auto &def = le01mr::PARAMS[i];
+		if (reading.values[i].has_value ()) {
+			line += fmt::format ("  {}={:.{}f}{}{}",
+								 symbols[i],
+								 *reading.values[i],
+								 def.decimals,
+								 def.unit[0] == '-' ? "" : " ",
+								 def.unit[0] == '-' ? "" : def.unit);
+		}
 		else {
-			rawSkipZeros = true;
-			SPDLOG_DEBUG ("rawSkipZeros enabled");
+			line += fmt::format ("  {}=---", symbols[i]);
 		}
 	}
+
+	std::cout << line << std::endl;
 }
+
+} // namespace
 
 int main (int argc, char *argv[])
 {
-	spdlog::set_level (spdlog::level::debug);
-	SPDLOG_INFO ("============ MODBUS2APRS  =============");
+	// All log messages go through a distributing sink: to stderr while the full screen UI is not
+	// active, to a ring buffer displayed inside the UI and optionally to a log file
+	auto ringSink = std::make_shared<spdlog::sinks::ringbuffer_sink_mt> (256);
+	ringSink->set_pattern ("%H:%M:%S %L %v");
+	auto consoleSink = std::make_shared<spdlog::sinks::stderr_color_sink_mt> ();
+	consoleSink->set_pattern ("[%H:%M:%S.%e] [%^%l%$] %v");
+	auto distSink = std::make_shared<spdlog::sinks::dist_sink_mt> ();
+	distSink->add_sink (consoleSink);
+	distSink->add_sink (ringSink);
+	auto logger = std::make_shared<spdlog::logger> ("le01mr", distSink);
+	spdlog::set_default_logger (logger);
+	spdlog::set_level (spdlog::level::info);
 
-	const int REMOTE_ID = 1;
-	modbus_t *ctx = nullptr;
-	std::array<uint16_t, 16> tab_reg = {0u};
+	const AppConfig config = parseArgs (argc, argv);
 
-	parseArgs (argc, argv);
-
-	SPDLOG_DEBUG ("modbusSetRtsDelay: {}", modbusSetRtsDelay);
-	SPDLOG_DEBUG ("modbusSetRtuMode: {}", modbusSetRtuMode);
-
-	SerialIoRaw serialIoRaw{portName,
-							modbusSetRtsDelay,
-							modbusSetSerialMode485,
-							rawSkipBytes,
-							rawSkipZeros};
-
-	if (rawModeEnabled) {
-
-		SPDLOG_INFO ("RTU communication will be done using raw functions.");
-		SPDLOG_INFO ("set of --raw-xxxxxxx parameters will be applied now.");
+	if (config.verbose) {
+		spdlog::set_level (spdlog::level::debug);
 	}
-	else {
-		ctx = modbus_new_rtu (portName.c_str (), 9600, 'N', 8, 2);
-		if (ctx == NULL) {
-			SPDLOG_ERROR ("Unable to create the libmodbus context\n");
+
+	if (!config.logFile.empty ()) {
+		try {
+			auto fileSink = std::make_shared<spdlog::sinks::basic_file_sink_mt> (config.logFile);
+			fileSink->set_pattern ("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
+			distSink->add_sink (fileSink);
+			logger->flush_on (spdlog::level::warn);
+		}
+		catch (const spdlog::spdlog_ex &ex) {
+			SPDLOG_ERROR ("Cannot open log file: {}", ex.what ());
 			return -1;
 		}
+	}
 
-		modbus_set_debug (ctx, TRUE);
+	SPDLOG_INFO ("============ LE-01MR v2 energy meter monitor =============");
 
-		int mode;
+	const bool modbusDebug = config.modbusDebug && config.noUi;
+	if (config.modbusDebug && !config.noUi) {
+		SPDLOG_WARN ("--modbus-debug ignored, it works only together with --no-ui");
+	}
 
-		if (modbusSetSerialMode485) {
-			mode = MODBUS_RTU_RS485;
+	std::unique_ptr<SerialIoIf> io;
+	try {
+		if (config.rawModeEnabled) {
+			SPDLOG_INFO ("RTU communication will be done using raw functions.");
+			io = std::make_unique<SerialIoRaw> (config.serial,
+												config.rawSkipBytes,
+												config.rawSkipZeros,
+												std::chrono::milliseconds (config.timeoutMs));
 		}
 		else {
-			mode = MODBUS_RTU_RS232;
+			SPDLOG_DEBUG ("modbusSetRtsDelay: {}", config.serial.rtsDelayUs);
+			SPDLOG_DEBUG ("modbusSetRtuMode: {}", config.serial.rtsMode);
+			io = std::make_unique<SerialIoLibmodbus> (config.serial,
+													  std::chrono::milliseconds (config.timeoutMs),
+													  modbusDebug);
 		}
-
-		if (modbus_rtu_set_serial_mode (ctx, mode) == -1) {
-			SPDLOG_ERROR ("Set serial mode failed: {}\n", modbus_strerror (errno));
-			SPDLOG_ERROR ("Maybe MODBUS_RTU_RS485 is not supported?");
-		}
-
-		if (modbus_rtu_set_rts (ctx, modbusSetRtuMode) == -1) {
-			SPDLOG_ERROR ("Set rts failed: {}\n", modbus_strerror (errno));
-		}
-
-		modbus_rtu_set_rts_delay (ctx, modbusSetRtsDelay);
-		if (modbus_connect (ctx) == -1) {
-			SPDLOG_ERROR ("Connection failed: {}\n", modbus_strerror (errno));
-			modbus_free (ctx);
-			return -1;
-		}
-
-		modbus_set_slave (ctx, REMOTE_ID);
+	}
+	catch (const std::exception &ex) {
+		SPDLOG_ERROR ("{}", ex.what ());
+		return -1;
 	}
 
-	// initialize console sudo-GUI here. display this in similar way
-	// as HTOP displays CPU or memory usage. A horizontal bar graph with description on the left a
-	// value on the right. only: Voltage, Current, Active Power, Apparent Power, Reactive Power,
-	// Frequency and Power Factor should be displayed using bar graph. The rest only as a 
-	// label - value with unit
+	// open CSV output file for appending, a default name is generated from current date and time
+	std::optional<CsvWriter> csv;
+	try {
+		csv.emplace (config.outputFileName.empty () ? CsvWriter::defaultFileName ()
+													: config.outputFileName);
+	}
+	catch (const std::exception &ex) {
+		SPDLOG_ERROR ("{}", ex.what ());
+		return -1;
+	}
+	SPDLOG_INFO ("Readings are stored in: {}", csv->path ());
 
-	// open CSV output file for appending. if a user didn't specified an output file
-	// in a console parameter, create new one with a filename generated from current date and time
+	le01mr::Meter meter{*io,
+						static_cast<uint8_t> (config.slaveId),
+						config.readMode,
+						config.swapWords,
+						static_cast<uint16_t> (config.maxRegisters)};
 
-	while (true) {
+	// handlers must be installed before the UI, so ncurses won't install its own
+	installSignalHandlers ();
 
-		// sleep for one second
-		sleep (1);
+	std::unique_ptr<ConsoleUi> ui;
+	if (!config.noUi) {
+		UiConfig uiConfig;
+		uiConfig.connection = io->description ();
+		uiConfig.slaveId = config.slaveId;
+		uiConfig.intervalS = config.intervalS;
+		uiConfig.csvPath = csv->path ();
+		uiConfig.maxCurrentA = config.maxCurrentA;
+		uiConfig.maxPowerW = config.maxPowerW;
 
-		// read data from Electrical energy meter LE-01MR v2
-		if (rawModeEnabled) {
-			// request all holding registers listed in the comment on top of the file
+		ui = ConsoleUi::create (uiConfig, ringSink);
+		if (ui) {
+			distSink->remove_sink (consoleSink);
+			ui->draw ();
 		}
 		else {
-			// request all holding registers listed in the comment on top of the file
-		}
-
-		// decode values from raw register value to real units
-
-		// update display
-
-		// store all registers in CSV file
-	}
-
-	if (rawModeEnabled) {
-		;
-	}
-	else {
-		if (ctx != nullptr) {
-			modbus_free (ctx);
+			SPDLOG_WARN ("Not running on a terminal, full screen UI disabled");
 		}
 	}
+
+	const auto period = std::chrono::duration_cast<std::chrono::steady_clock::duration> (
+		std::chrono::duration<double> (config.intervalS));
+	auto nextReading = std::chrono::steady_clock::now ();
+	unsigned long rowsStored = 0;
+
+	while (stopRequested == 0) {
+		nextReading += period;
+
+		// read data from Electrical energy meter LE-01MR v2 and decode them to physical values
+		try {
+			const le01mr::Reading reading = meter.read ();
+
+			if (ui) {
+				ui->onReadSuccess (reading);
+			}
+			else {
+				printReading (reading);
+			}
+
+			// store all values in CSV file
+			if (csv->write (reading)) {
+				rowsStored++;
+			}
+			else {
+				SPDLOG_ERROR ("Writing to {} failed!", csv->path ());
+			}
+		}
+		catch (const std::exception &ex) {
+			if (stopRequested != 0) {
+				break; // interrupted by a signal, not a real communication problem
+			}
+			SPDLOG_ERROR ("Reading the meter failed: {}", ex.what ());
+			if (ui) {
+				ui->onReadFailure (ex.what ());
+			}
+		}
+
+		// update display and wait for the next reading, while handling key presses. Keyboard is
+		// polled at least once per cycle, even if communication took longer than the interval
+		while (stopRequested == 0) {
+			if (ui) {
+				ui->draw ();
+			}
+
+			const auto remainingMs = std::max<long long> (
+				0,
+				std::chrono::ceil<std::chrono::milliseconds> (nextReading -
+															  std::chrono::steady_clock::now ())
+					.count ());
+			const int waitMs = static_cast<int> (std::min<long long> (remainingMs, 250));
+
+			if (ui) {
+				if (!ui->processInput (waitMs)) {
+					stopRequested = 1;
+				}
+			}
+			else if (waitMs > 0) {
+				std::this_thread::sleep_for (std::chrono::milliseconds (waitMs));
+			}
+
+			if (std::chrono::steady_clock::now () >= nextReading) {
+				break;
+			}
+		}
+
+		// communication took longer than the interval, don't try to catch up
+		const auto now = std::chrono::steady_clock::now ();
+		if (now > nextReading) {
+			nextReading = now;
+		}
+	}
+
+	if (ui) {
+		ui.reset ();
+		distSink->add_sink (consoleSink);
+	}
+
+	SPDLOG_INFO ("Finished, {} readings stored in {}", rowsStored, csv->path ());
 
 	return 0;
 }

@@ -1,5 +1,5 @@
 #include "raw_mode.hpp"
-#include <exception>
+#include "serial_io_interface.h"
 #include <stdexcept>
 
 #pragma push_macro("U")
@@ -7,188 +7,149 @@
 // pragma required as a workaround of possible conflict with cpprestsdk.
 // more info here: https://github.com/fmtlib/fmt/issues/3330
 #include "spdlog/fmt/bin_to_hex.h"
-#include "spdlog/sinks/stdout_color_sinks.h"
 #include "spdlog/spdlog.h"
 #pragma pop_macro("U")
 
-RawMode::RawMode (uint16_t slaveId, bool skipPrecedingZeros, uint8_t skipPrecedingBytes)
+RawMode::RawMode (uint8_t slaveId, bool skipPrecedingZeros, uint8_t skipPrecedingBytes)
 	: m_slaveId{slaveId}, m_skipPrecedingZeros{skipPrecedingZeros},
 	  m_skipPrecedingBytes{skipPrecedingBytes}
 {
 }
 
-void RawMode::createRequest (std::span<uint8_t> out)
+std::array<uint8_t, RawMode::REQUEST_SIZE> RawMode::createRequest (uint16_t startRegister,
+																	uint16_t count) const
 {
-	// put the slave address
-	out[0] = (uint8_t)m_slaveId;
+	if (count == 0 || count > MAX_REGISTERS) {
+		throw std::invalid_argument ("Invalid number of registers to read: " +
+									 std::to_string (count));
+	}
 
-	// put the function code - read holding registers
+	std::array<uint8_t, REQUEST_SIZE> out{};
+
+	// slave address
+	out[0] = m_slaveId;
+
+	// function code - read holding registers
 	out[1] = 0x03;
 
-	// put the base address of a register cluster to be read from the slave
-	out[2] = 0;
-	out[3] = 0;
+	// base address of a register cluster to be read from the slave
+	out[2] = (startRegister >> 8) & 0xFF;
+	out[3] = startRegister & 0xFF;
 
-	// put the numbers of register to be read from slave
-	out[4] = 0x00; // all in all modbus RTU can transfer no more than 125 at once
-	out[5] = 8;
+	// number of registers to be read from slave
+	out[4] = (count >> 8) & 0xFF;
+	out[5] = count & 0xFF;
 
-	// calculate the CRC from the content
-	const uint16_t crc = RawMode::calculateRtuCrc (out.subspan (0, out.size () - 2));
-
-	// append the crc value
+	// CRC, low byte first
+	const uint16_t crc = RawMode::calculateRtuCrc (std::span{out}.first (6));
 	out[6] = crc & 0xFF;
-	out[7] = (crc & 0xFF00) >> 8;
+	out[7] = (crc >> 8) & 0xFF;
+
+	return out;
 }
 
-std::array<uint16_t, 16> RawMode::parseResponse (const std::span<uint8_t> &in)
+std::optional<std::vector<uint16_t>> RawMode::parseResponse (std::span<const uint8_t> in,
+															 uint16_t expectedCount) const
 {
-	// SensorData out = {0u};
-
-	std::array<uint16_t, 16> registersValues = {0u};
-
-	std::span<uint8_t> working;
+	std::span<const uint8_t> working = in;
 
 	if (m_skipPrecedingBytes > 0) {
-		SPDLOG_INFO ("Skipping first {} bytes", m_skipPrecedingBytes);
-		working = in.subspan (m_skipPrecedingBytes, in.size () - m_skipPrecedingBytes);
+		if (in.size () <= m_skipPrecedingBytes) {
+			return std::nullopt;
+		}
+		working = in.subspan (m_skipPrecedingBytes);
 	}
 	else if (m_skipPrecedingZeros) {
-		int i = 0;
-
-		for (uint8_t current : in) {
-			if (current != 0) {
-				break;
-			}
-			else {
-				i++;
-			}
+		size_t i = 0;
+		while (i < in.size () && in[i] == 0) {
+			i++;
 		}
+		working = in.subspan (i);
+	}
 
-		working = in.subspan (i, in.size () - i);
-		SPDLOG_INFO ("Walked over first {} zeros. First non zero byte is 0x{:X}", i, working[0]);
+	// the shortest valid frame (exception response) is 5 bytes long
+	if (working.size () < 5) {
+		return std::nullopt;
+	}
+
+	const uint8_t function = working[1];
+	size_t frameLength = 0;
+
+	if ((function & 0x80) != 0) {
+		// slave address, function | 0x80, exception code, CRC
+		frameLength = 5;
+	}
+	else if (function == 0x03) {
+		// slave address, function, byte count, data, CRC
+		frameLength = 5u + working[2];
 	}
 	else {
-		working = in;
+		throw std::runtime_error (
+			fmt::format ("Unexpected function code 0x{:02X} in response: {}",
+						 function,
+						 spdlog::to_hex (working.begin (), working.end ())));
 	}
 
-	uint16_t previousCrc = 0xFFFF;
-
-	uint8_t len = 0;
-
-	// checking CRC
-	for (const uint8_t byte : working) {
-		previousCrc = RawMode::calculateStreamRtuCrc (previousCrc, byte);
-
-		len++;
-
-		if (previousCrc == 0x00) {
-			const uint16_t correctCrc = working[len - 2] | (working[len - 1] << 8);
-			SPDLOG_INFO ("received CRC 0x{:X} is correct. True response length is: {}",
-						 correctCrc,
-						 len);
-			break;
-		}
+	if (working.size () < frameLength) {
+		return std::nullopt;
 	}
 
-	if (previousCrc != 0x00) {
-		SPDLOG_ERROR ("CRC error!!!!");
-		throw std::runtime_error ("CRC error");
+	const std::span<const uint8_t> frame = working.first (frameLength);
+
+	// CRC calculated over a whole frame, including the CRC itself, is zero for a valid frame
+	if (calculateRtuCrc (frame) != 0) {
+		throw std::runtime_error (
+			fmt::format ("CRC error in response: {}", spdlog::to_hex (frame.begin (), frame.end ())));
 	}
 
-	// iterator through input table and registers table
-	int j = 3;
+	SPDLOG_TRACE ("Valid response frame: {}", spdlog::to_hex (frame.begin (), frame.end ()));
 
-	// fetch slave address
-	uint8_t data = working[0];
-
-	// TODO: store slave address
-	const uint8_t slave_address_from_frame = data;
-
-	// fetch function code
-	data = working[1];
-
-	// if the exception flag is set
-	if ((data & 0x80) > 0) {
-		// get error code
-		data = working[2];
-
-		// parse the exception value
-		static char whatMessage[64];
-		snprintf (whatMessage,
-				  64,
-				  "Modbus RTU exception flag, [0]: 0x%X [1]: 0x%X [2]: 0x%X",
-				  in[0],
-				  in[1],
-				  in[2]);
-
-		throw std::runtime_error (whatMessage);
+	if (frame[0] != m_slaveId) {
+		throw std::runtime_error (
+			fmt::format ("Response from unexpected slave address {} (expected {})", frame[0], m_slaveId));
 	}
 
-	// check if the function code is correct or not
-	else if (data == 0x03 || data == 0x04) {
-
-		// check if this is an answer from the slave we expect
-		if (slave_address_from_frame == m_slaveId) {
-			// fetch the function result lenght in bytes
-			data = working[2];
-
-			// store amount of registers in this response
-			const uint8_t number_of_registers = data / 2;
-
-			// get all registers values
-			for (int i = 0; i < number_of_registers; i++) {
-				registersValues[i] = working[j] << 8 | working[j + 1];
-
-				// moving to next 16bit word with next register
-				j += 2;
-			}
-		}
-		else {
-			throw std::runtime_error ("Unexpected slave address");
-		}
+	if ((function & 0x80) != 0) {
+		throw ModbusException (frame[2]);
 	}
-	else {
-		// if not exit with an error as this isn't
-		// correct parser for this modbus function
-		throw std::runtime_error ("Unknown Modbus function");
+
+	if (frame[2] != expectedCount * 2) {
+		throw std::runtime_error (fmt::format ("Unexpected byte count in response: {}, expected {}",
+											   frame[2],
+											   expectedCount * 2));
+	}
+
+	std::vector<uint16_t> registersValues (expectedCount);
+	for (size_t i = 0; i < expectedCount; i++) {
+		registersValues[i] = static_cast<uint16_t> (frame[3 + 2 * i] << 8 | frame[4 + 2 * i]);
 	}
 
 	return registersValues;
 }
 
-uint16_t RawMode::calculateRtuCrc (const std::span<uint8_t> &in)
+uint16_t RawMode::calculateRtuCrc (std::span<const uint8_t> in)
 {
 	uint16_t crc = 0xFFFF;
 
-	for (int pos = 0; pos < in.size (); pos++) {
-		crc ^= (uint16_t)in[pos]; // XOR byte into least sig. byte of crc
-
-		for (int i = 8; i != 0; i--) { // Loop over each bit
-			if ((crc & 0x0001) != 0) { // If the LSB is set
-				crc >>= 1;			   // Shift right and XOR 0xA001
-				crc ^= 0xA001;
-			}
-			else		   // Else LSB is not set
-				crc >>= 1; // Just shift right
-		}
+	for (const uint8_t byte : in) {
+		crc = calculateStreamRtuCrc (crc, byte);
 	}
+
 	// Note, this number has low and high bytes swapped, so use it accordingly (or swap bytes)
 	return crc;
 }
 
 uint16_t RawMode::calculateStreamRtuCrc (uint16_t previousCrc, uint8_t currentData)
 {
-	int i;
+	previousCrc ^= (uint16_t)currentData; // XOR byte into least sig. byte of crc
 
-	previousCrc ^= (uint16_t)currentData;
-	for (i = 0; i < 8; ++i) {
-		if (previousCrc & 1) {
-			previousCrc = (previousCrc >> 1);
-			previousCrc = (previousCrc) ^ 0xA001;
+	for (int i = 0; i < 8; ++i) { // Loop over each bit
+		if (previousCrc & 1) {	  // If the LSB is set shift right and XOR 0xA001
+			previousCrc = (previousCrc >> 1) ^ 0xA001;
 		}
-		else
+		else { // Else LSB is not set, just shift right
 			previousCrc = (previousCrc >> 1);
+		}
 	}
 
 	return previousCrc;
