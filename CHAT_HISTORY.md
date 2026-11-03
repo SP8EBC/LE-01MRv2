@@ -125,3 +125,46 @@ Not tested: RTS toggling in raw mode with `--mode-485` (the adapter doesn't need
 > put a history of this chat in a markdown file in the source code directory
 
 → this file.
+
+## 8. Request
+
+> default serial port settings are 9600 8N1 and modbus address 1, so modify parseArgs to use them
+> if user will not type these manually
+
+No change was needed – `parseArgs` already defaulted to 9600 baud, parity N, 1 stop bit
+(changed from 2 in step 5) and slave address 1; data bits are always 8. Only the serial port
+remains mandatory.
+
+## 9. Request
+
+> add CSV file rotate mechanism, if the file will grow to about 5MB in size. The mechanism should
+> work differently if a user has given a file name or not. In case of auto-generated name, the
+> application should simply close an old file, then regenerate a filename once again and create a
+> new file, with new timestamp. If the user has chosen a filename, the file should be closed and
+> then renamed by adding a prefix with a timestamp when it was rotated. Then a new file with the
+> same name given by the user should be created
+
+Implemented in `CsvWriter`:
+
+- the file size is tracked (initial size of an existing file + bytes written); when it reaches the
+  limit, rotation happens before the next row is written,
+- auto-generated name: close, generate `le01mr_YYYYmmdd_HHMMSS.csv` again, open the new file,
+- name from `--out`: close, rename to `<name>_YYYYmmdd_HHMMSS.<ext>` in the same directory (time of
+  rotation), create a new file with the original name,
+- every new file gets the CSV header; an existing name gets a `_1`, `_2`… suffix instead of being
+  overwritten,
+- if the rotation fails (e.g. rename not permitted), an error is logged, writing continues to the
+  old file and the next attempt is made after it grows by another 10%,
+- new option `--csv-max-size` (MB, default 5, 0 disables rotation),
+- the UI shows the name of the file currently written.
+
+Tested on the real meter with `--csv-max-size 0.002` in both modes: the auto-named file
+continued in a new file with a new timestamp; `mine.csv` was renamed to
+`20261103_205629_mine.csv` and a new `mine.csv` with a header was created.
+
+## 10. Request
+
+> in this case "YYYYmmdd_HHMMSS_<name>"  <name> should be at the begining of a filename
+
+The rotated user file is now named `<name>_YYYYmmdd_HHMMSS.<ext>`, e.g. `mine.csv` →
+`mine_20261103_205932.csv` (the extension stays at the end).

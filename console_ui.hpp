@@ -37,6 +37,7 @@ class ConsoleUi {
 	ConsoleUi &operator= (const ConsoleUi &) = delete;
 
 	void onReadSuccess (const le01mr::Reading &reading);
+	void setCsvPath (const std::string &path) { m_config.csvPath = path; }
 	void onReadFailure (const std::string &error);
 
 	void draw ();

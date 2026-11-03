@@ -24,6 +24,24 @@ std::string formatTime (std::chrono::system_clock::time_point time, const char *
 	return std::string (buffer, length);
 }
 
+//! Returns path, or path with "_1", "_2"... added before the extension if it already exists
+std::filesystem::path uniquePath (const std::filesystem::path &path)
+{
+	std::error_code ec;
+	if (!std::filesystem::exists (path, ec)) {
+		return path;
+	}
+
+	for (int i = 1;; i++) {
+		std::filesystem::path candidate = path;
+		candidate.replace_filename (path.stem ().string () + "_" + std::to_string (i) +
+									path.extension ().string ());
+		if (!std::filesystem::exists (candidate, ec)) {
+			return candidate;
+		}
+	}
+}
+
 } // namespace
 
 std::string CsvWriter::defaultFileName ()
@@ -36,29 +54,95 @@ std::string CsvWriter::formatLocalTime (std::chrono::system_clock::time_point ti
 	return formatTime (time, "%Y-%m-%d %H:%M:%S");
 }
 
-CsvWriter::CsvWriter (std::string path) : m_path{std::move (path)}
+CsvWriter::CsvWriter (const std::string &path, std::uintmax_t maxSizeBytes)
+	: m_autoName{path.empty ()}, m_maxSize{maxSizeBytes},
+	  m_path{path.empty () ? uniquePath (defaultFileName ()).string () : path}
+{
+	open ();
+}
+
+void CsvWriter::open ()
 {
 	std::error_code ec;
-	const bool needsHeader =
-		!std::filesystem::exists (m_path, ec) || std::filesystem::file_size (m_path, ec) == 0;
+	m_size = std::filesystem::exists (m_path, ec) ? std::filesystem::file_size (m_path, ec) : 0;
+	if (ec) {
+		m_size = 0;
+	}
 
 	m_file.open (m_path, std::ios::out | std::ios::app);
 	if (!m_file.is_open ()) {
 		throw std::runtime_error ("Cannot open CSV output file: " + m_path);
 	}
 
-	if (needsHeader) {
-		m_file << "Timestamp,Unix time";
+	if (m_size == 0) {
+		std::string header = "Timestamp,Unix time";
 		for (const auto &param : le01mr::PARAMS) {
-			m_file << ',' << param.name << " [" << param.unit << ']';
+			header += fmt::format (",{} [{}]", param.name, param.unit);
 		}
-		m_file << '\n';
+		header += '\n';
+
+		m_file << header;
 		m_file.flush ();
+		m_size += header.size ();
+	}
+
+	m_rotateAt = m_maxSize;
+}
+
+void CsvWriter::rotate ()
+{
+	const std::string oldPath = m_path;
+	const std::uintmax_t oldSize = m_size;
+	m_file.close ();
+
+	try {
+		if (m_autoName) {
+			m_path = uniquePath (defaultFileName ()).string ();
+			open ();
+			SPDLOG_INFO ("CSV file {} reached {} kB, continuing in {}", oldPath, oldSize / 1024, m_path);
+		}
+		else {
+			const std::filesystem::path current{m_path};
+			std::filesystem::path archive = current;
+			archive.replace_filename (
+				current.stem ().string () +
+				formatTime (std::chrono::system_clock::now (), "_%Y%m%d_%H%M%S") +
+				current.extension ().string ());
+			archive = uniquePath (archive);
+
+			std::filesystem::rename (current, archive);
+			open ();
+			SPDLOG_INFO ("CSV file {} reached {} kB, old data moved to {}",
+						 m_path,
+						 oldSize / 1024,
+						 archive.string ());
+		}
+	}
+	catch (const std::exception &ex) {
+		SPDLOG_ERROR ("Rotating CSV file {} failed: {}", oldPath, ex.what ());
+
+		// keep writing to the old file and try again after it grows another 10%
+		m_path = oldPath;
+		if (!m_file.is_open ()) {
+			open ();
+		}
+		m_rotateAt = m_size + m_maxSize / 10;
 	}
 }
 
 bool CsvWriter::write (const le01mr::Reading &reading)
 {
+	if (m_maxSize > 0 && m_size >= m_rotateAt) {
+		try {
+			rotate ();
+		}
+		catch (const std::exception &ex) {
+			// even reopening the old file failed
+			SPDLOG_ERROR ("{}", ex.what ());
+			return false;
+		}
+	}
+
 	std::string line = formatLocalTime (reading.timestamp);
 	line += fmt::format (
 		",{}",
@@ -81,5 +165,7 @@ bool CsvWriter::write (const le01mr::Reading &reading)
 		m_file.clear ();
 		return false;
 	}
+
+	m_size += line.size ();
 	return true;
 }

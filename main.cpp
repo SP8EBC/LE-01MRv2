@@ -54,6 +54,7 @@ struct AppConfig {
 	bool rawSkipZeros = false;
 
 	std::string outputFileName;
+	double csvMaxSizeMb = 5.0;
 	double intervalS = 1.0;
 	unsigned timeoutMs = 1000;
 	le01mr::ReadMode readMode = le01mr::ReadMode::Auto;
@@ -115,6 +116,12 @@ AppConfig parseArgs (int argc, char *argv[])
 								   po::value<std::string> (&config.outputFileName),
 								   " : Path to output CSV file. Data are appended to an existing "
 								   "file. By default le01mr_YYYYmmdd_HHMMSS.csv is created");
+	generalOptions.add_options () (
+		"csv-max-size",
+		po::value<double> (&config.csvMaxSizeMb)->default_value (5.0),
+		" : CSV file size in MB which triggers rotation, 0 disables it. An auto-named file is "
+		"closed and a new one with a new timestamp is created. A file named with --out is "
+		"renamed to <name>_YYYYmmdd_HHMMSS.<ext> and a new file with the same name is created");
 	generalOptions.add_options () (
 		"interval,i",
 		po::value<double> (&config.intervalS)->default_value (1.0),
@@ -236,6 +243,10 @@ AppConfig parseArgs (int argc, char *argv[])
 	}
 	else {
 		exitWithUsage (optionsDescription, "Read mode must be one of: auto, block, grouped", -2);
+	}
+
+	if (config.csvMaxSizeMb < 0.0) {
+		exitWithUsage (optionsDescription, "csv-max-size can't be negative", -2);
 	}
 
 	if (config.maxRegisters < 2 || config.maxRegisters > 125) {
@@ -375,8 +386,8 @@ int main (int argc, char *argv[])
 	// open CSV output file for appending, a default name is generated from current date and time
 	std::optional<CsvWriter> csv;
 	try {
-		csv.emplace (config.outputFileName.empty () ? CsvWriter::defaultFileName ()
-													: config.outputFileName);
+		csv.emplace (config.outputFileName,
+					 static_cast<std::uintmax_t> (config.csvMaxSizeMb * 1024.0 * 1024.0));
 	}
 	catch (const std::exception &ex) {
 		SPDLOG_ERROR ("{}", ex.what ());
@@ -438,6 +449,10 @@ int main (int argc, char *argv[])
 			}
 			else {
 				SPDLOG_ERROR ("Writing to {} failed!", csv->path ());
+			}
+
+			if (ui) {
+				ui->setCsvPath (csv->path ()); // changes when the file is rotated
 			}
 		}
 		catch (const std::exception &ex) {
