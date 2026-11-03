@@ -1,0 +1,42 @@
+# Modbus Registers Map
+
+## 0x03 – Read Holding Registers
+
+Data reading, according to Modbus RTU protocol, is carried out using the Read Holding Register command (command code 0x03).
+
+| Lp. | Parameter | Base addr HEX | Base addr DEC | R/W | Num of registers | Variable type | Unit | Scaling register value → physical |
+|---:|---|---|---:|:---:|---:|---|---|---:|
+| 1 | Voltage | 0x100 | 256 | R | 2 | INT32 | V | 0.001 |
+| 2 | Current | 0x102 | 258 | R | 2 | INT32 | A | 0.001 |
+| 3 | Active Power | 0x104 | 260 | R | 2 | INT32 | W | 1 |
+| 4 | Apparent Power | 0x106 | 262 | R | 2 | INT32 | VA | 1 |
+| 5 | Reactive Power | 0x108 | 264 | R | 2 | INT32 | Var | 1 |
+| 6 | Frequency | 0x10A | 266 | R | 1 | INT16 | Hz | 0.1 |
+| 7 | Power factor | 0x10B | 267 | R | 1 | INT16 | - | 0.001 |
+| 8 | Total consumed (imported) active energy | 0x10E | 270 | R | 2 | INT32 | kWh | 0.01 |
+| 9 | Total returned (exported) active energy | 0x118 | 280 | R | 2 | INT32 | kWh | 0.01 |
+| 10 | Total active energy | 0x122 | 290 | R | 2 | INT32 | kWh | 0.01 |
+| 11 | Total consumed (imported) reactive energy | 0x12C | 300 | R | 2 | INT32 | kvarh | 0.01 |
+| 12 | Total returned (exported) reactive energy | 0x136 | 310 | R | 2 | INT32 | kvarh | 0.01 |
+| 13 | Total reactive energy | 0x140 | 320 | R | 2 | INT32 | kvarh | 0.01 |
+| 14 | Total reactive energy in the first quadrant | 0x14A | 330 | R | 2 | INT32 | kvarh | 0.01 |
+| 15 | Total reactive energy in the second quad | 0x154 | 340 | R | 2 | INT32 | kvarh | 0.01 |
+| 16 | Total reactive energy in the third quad | 0x15E | 350 | R | 2 | INT32 | kvarh | 0.01 |
+| 17 | Total reactive energy in the fourth quad | 0x168 | 360 | R | 2 | INT32 | kvarh | 0.01 |
+| 18 | Resettable auxiliary active energy meter | 0x172 | 370 | R | 2 | INT32 | kWh | 0.01 |
+| 19 | Resettable auxiliary reactive energy meter | 0x174 | 372 | R | 2 | INT32 | kvarh | 0.01 |
+| 20 | Consumed (imported) active power demand | 0x176 | 374 | R | 2 | INT32 | W | 0.1 |
+
+## 0x06 – Write Single Register
+
+| Parameter | Base addr HEX | Base addr DEC | R/W | Num of registers |
+|---|---|---:|:---:|---:|
+| Auxiliary energy meter reset | 0x2002 | 8194 | R/W | 1 |
+
+Values to write:
+
+| Value | Action |
+|---|---|
+| 0x2000 | Active energy meter reset |
+| 0x4000 | Reactive energy meter reset |
+| 0x6000 | Active and reactive energy meter reset |

@@ -1,0 +1,19 @@
+{
+    "configurations": [
+        {
+            "name": "le-01mr",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "/usr/include/x86_64-linux-gnu/",
+                "/usr/include/",
+                "/usr/include/modbus"
+            ],
+            "defines": ["SAMPLERATE=9600", "BITRATE=1200", "__cplusplus=202002", "__cpp_lib_concepts=1"],
+            "compilerPath": "/usr/bin/gcc",
+            "cStandard": "c17",
+            "cppStandard": "gnu++20",
+            "intelliSenseMode": "linux-gcc-x64"
+        }
+    ],
+    "version": 4
+}
