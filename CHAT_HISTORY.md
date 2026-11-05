@@ -168,3 +168,120 @@ continued in a new file with a new timestamp; `mine.csv` was renamed to
 
 The rotated user file is now named `<name>_YYYYmmdd_HHMMSS.<ext>`, e.g. `mine.csv` →
 `mine_20261103_205932.csv` (the extension stays at the end).
+
+## 11. Request
+
+> create a commit message describing all changes made so far
+
+Most of the work had already been committed by the user as `964caaa`. Two messages were proposed:
+a full one (for `git commit --amend`) and a short one for the pending CSV rotation changes.
+
+## 12. Request
+
+> adds an option to upload current CSV file using SFTP to given remote server. The user is supposed
+> to use a paramter which will take an URI like this: 'example.net/directory1/directory2' -> without
+> the filename. Then, the application will upload currently opened file using SFTP each 10 minutes,
+> and when the file is eventually rotated (before it will close it). If target directory contains
+> this file already it should be overwritten
+
+Implemented in `sftp_uploader.hpp/.cpp` with libcurl (Debian's libcurl is built with libssh, so
+SFTP works without installing anything new):
+
+- `--sftp [user@]host[:port][/path]`. As in `sftp://` URLs the path is absolute (`~/dir` = remote
+  home directory, no path = home). `--sftp-interval` (minutes, default 10), `--sftp-key`
+  (private key file; by default ssh-agent and keys from `~/.ssh`),
+- uploads run in a background thread, so the meter is read every second even if the server is
+  slow or down; each upload sends the file up to the last complete row (size captured when the
+  upload is queued), so no half-written row can be uploaded,
+- before rotation (while the file is still open) the last version is uploaded under the name the
+  file will have after rotation (`<name>_YYYYmmdd_HHMMSS.csv`, or the unchanged auto-generated
+  name), so the remote directory mirrors the local one and the next periodic upload of the new
+  file doesn't overwrite the old data; the upload holds its own file descriptor, so the rename
+  doesn't affect it,
+- the final version of the current file is uploaded when the application exits (waits up to 60 s),
+- remote files are overwritten; host keys are verified against `~/.ssh/known_hosts`,
+- a connection check at startup (directory listing) reports problems immediately,
+- failed uploads of rotated files are retried every 60 s (up to 10 attempts); periodic uploads are
+  replaced by the next one; clear hints for an unknown host key or a failed key authentication,
+- UI: an `SFTP:` status line (in compact mode only a failure note on the status line).
+
+Tested against a temporary unprivileged `sshd` on 127.0.0.1:2222 with the real meter: periodic
+uploads, uploads of rotated files, final upload, overwriting an existing remote file (all remote
+files byte-identical to the local ones), unknown host key, missing remote directory, invalid
+target, UI line. Not tested: `~/` paths, ssh-agent / default-key authentication.
+
+## 13. Question
+
+> how the synchronization of a background thread is made? If the SFTP is working on a background
+> thread what exactly is sent to remote server? The content of the CSV is read to memory buffer
+> in-between consecutive Modbus readouts or You done it differently ?
+
+Answer: the CSV is **not** copied into a memory buffer. Each upload streams a fixed-length front
+portion of the file straight from disk. That works because the file only ever grows at the end,
+so bytes already written never change.
+
+### Queuing an upload (main thread, between readouts)
+
+After a reading is written to the CSV, the main loop checks whether the upload interval has
+passed. If so, it calls `SftpUploader::upload(path, size, remoteName, important)`, which:
+
+1. opens its own read-only descriptor to the file (`open(path, O_RDONLY)`), separate from the
+   `std::ofstream` used by `CsvWriter`,
+2. records the current size from `CsvWriter::size()` – the number of bytes successfully written;
+   every row is written whole and flushed straight away, so this always ends exactly at the end
+   of a complete row,
+3. puts a job `{descriptor, size, remoteName, important}` into a queue and wakes the worker.
+
+No file content is read at this point; it takes microseconds, so the next Modbus read isn't
+delayed.
+
+### What is sent (background thread)
+
+The worker takes the job and runs a libcurl SFTP upload. libcurl asks for data through a read
+callback, which uses `pread(fd, buf, n, offset)` to read straight from the file in libcurl's
+upload chunks (64 kB by default) and stops at the recorded `size`. Exactly bytes `[0, size)` are
+sent – the file as it was when the job was queued.
+
+```
+file:  [header][row1][row2]...[rowN] | [rowN+1][rowN+2]...   <- main thread keeps appending
+       <---------- size ------------>
+       this part is uploaded            not part of this upload; goes in the next one
+```
+
+Rows appended during the transfer are past `size`, so they aren't sent this time. The
+`[0, size)` part never changes, so the threads don't need a lock on the file itself. Once a row
+is flushed, the kernel makes it visible to the other descriptor immediately.
+
+### Rotation
+
+On rotation, `CsvWriter` calls a callback before it closes or renames the file, and the callback
+queues the job. The descriptor points to the file itself, not its name, so renaming it to
+`mine_YYYYmmdd_HHMMSS.csv` and closing the writer don't affect the upload in progress (even
+deleting the file wouldn't, while the descriptor is open). The descriptor is closed when the job
+finishes.
+
+### Shared state and how it's protected
+
+- `std::mutex m_mutex` protects the job queue, the busy/stop flags, and the status text and
+  failure flag shown in the UI. It is held only to change these, never during network transfer,
+  so the main thread never waits on a slow server.
+- `std::condition_variable m_cv`: the worker sleeps on it until a job arrives, a retry becomes
+  due or a stop is requested; `upload()` wakes it; on exit `finish()` waits on it until the queue
+  is empty and nothing is uploading, or until the timeout passes.
+- `std::atomic<bool> m_abort` is read without a lock by libcurl's progress callback; setting it
+  aborts a transfer in progress, so shutdown is quick even when the server hangs.
+- The UI calls `status()` / `failing()` once per redraw; each takes the mutex briefly and returns
+  a copy.
+- Also needed for threading: `curl_global_init()` in `main` before the thread starts,
+  `CURLOPT_NOSIGNAL`, and the thread-safe (`_mt`) spdlog sinks.
+- A periodic upload still waiting in the queue is replaced by the next one for the same file, so
+  a dead server never accumulates a backlog.
+
+### Limitations
+
+- The design assumes only this program changes the file. If something truncates it, `pread`
+  comes up short and that upload is aborted and reported as failed; nothing is corrupted.
+- Known bug: if a write fails partway through (e.g. disk full), `m_size` isn't increased but part
+  of the row may already be in the file. From then on uploads would end partway through a row,
+  until the next rotation. Fix (not implemented yet): after a failed write, re-read the real file
+  size and correct for the partial row.

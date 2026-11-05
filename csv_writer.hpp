@@ -4,6 +4,7 @@
 #include "le01mr.hpp"
 #include <cstdint>
 #include <fstream>
+#include <functional>
 #include <string>
 
 /**
@@ -33,6 +34,18 @@ class CsvWriter {
 	//! path of the file currently written
 	const std::string &path () const { return m_path; }
 
+	//! size of the file currently written, always at the end of a complete row
+	std::uintmax_t size () const { return m_size; }
+
+	/**
+	 * Called during rotation, while the file is still open and before it is renamed.
+	 * Arguments: current path, its size, file name it will have after the rotation.
+	 */
+	using RotationCallback =
+		std::function<void (const std::string &, std::uintmax_t, const std::string &)>;
+
+	void setRotationCallback (RotationCallback callback) { m_rotationCallback = std::move (callback); }
+
 	//! le01mr_YYYYmmdd_HHMMSS.csv generated from current local date and time
 	static std::string defaultFileName ();
 
@@ -51,6 +64,8 @@ class CsvWriter {
 
 	//! size at which the next rotation is attempted, moved forward if a rotation fails
 	std::uintmax_t m_rotateAt = 0;
+
+	RotationCallback m_rotationCallback;
 };
 
 #endif /* F2C8A4E6_9D3B_4A71_B5E2_0C6D8F1A7B39 */

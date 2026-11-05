@@ -1,7 +1,7 @@
-OBJS := main.o le01mr.o csv_writer.o console_ui.o raw_mode.o serial_io_raw.o serial_io_libmodbus.o ./wjwwood_serial/src/serial.o ./wjwwood_serial/src/impl/unix.o
+OBJS := main.o le01mr.o csv_writer.o console_ui.o raw_mode.o serial_io_raw.o serial_io_libmodbus.o sftp_uploader.o ./wjwwood_serial/src/serial.o ./wjwwood_serial/src/impl/unix.o
 DEFINES := -DSPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_DEBUG
 INCLUDES := -I/usr/include/modbus -I/usr/include/spdlog -I ./wjwwood_serial/include -I.
-LIBS := -lmodbus -lfmt -lboost_program_options -lncursesw
+LIBS := -lmodbus -lfmt -lboost_program_options -lncursesw -lcurl -pthread
 LIBS_DIRS := -L/lib/x86_64-linux-gnu -L/lib/i386-linux-gnu -L/usr/lib
 WARNS := -Wall -Wmaybe-uninitialized -Wpedantic -Wno-return-local-addr -Wparentheses
 

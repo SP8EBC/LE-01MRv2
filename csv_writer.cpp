@@ -93,6 +93,21 @@ void CsvWriter::rotate ()
 {
 	const std::string oldPath = m_path;
 	const std::uintmax_t oldSize = m_size;
+
+	// a file named by the user is renamed to <name>_YYYYmmdd_HHMMSS.<ext>
+	const std::filesystem::path current{m_path};
+	std::filesystem::path archive = current;
+	if (!m_autoName) {
+		archive.replace_filename (current.stem ().string () +
+								  formatTime (std::chrono::system_clock::now (), "_%Y%m%d_%H%M%S") +
+								  current.extension ().string ());
+		archive = uniquePath (archive);
+	}
+
+	if (m_rotationCallback) {
+		m_rotationCallback (m_path, m_size, archive.filename ().string ());
+	}
+
 	m_file.close ();
 
 	try {
@@ -102,14 +117,6 @@ void CsvWriter::rotate ()
 			SPDLOG_INFO ("CSV file {} reached {} kB, continuing in {}", oldPath, oldSize / 1024, m_path);
 		}
 		else {
-			const std::filesystem::path current{m_path};
-			std::filesystem::path archive = current;
-			archive.replace_filename (
-				current.stem ().string () +
-				formatTime (std::chrono::system_clock::now (), "_%Y%m%d_%H%M%S") +
-				current.extension ().string ());
-			archive = uniquePath (archive);
-
 			std::filesystem::rename (current, archive);
 			open ();
 			SPDLOG_INFO ("CSV file {} reached {} kB, old data moved to {}",

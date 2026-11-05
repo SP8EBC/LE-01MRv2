@@ -38,6 +38,13 @@ class ConsoleUi {
 
 	void onReadSuccess (const le01mr::Reading &reading);
 	void setCsvPath (const std::string &path) { m_config.csvPath = path; }
+
+	//! enables the SFTP status line
+	void setSftpStatus (const std::string &status, bool failing)
+	{
+		m_sftpStatus = status;
+		m_sftpFailing = failing;
+	}
 	void onReadFailure (const std::string &error);
 
 	void draw ();
@@ -74,6 +81,9 @@ class ConsoleUi {
 	std::chrono::system_clock::time_point m_lastErrorTime;
 	unsigned long m_readsOk = 0;
 	unsigned long m_readsFailed = 0;
+
+	std::string m_sftpStatus; //!< empty if SFTP upload isn't used
+	bool m_sftpFailing = false;
 };
 
 #endif /* D9A6E2B4_7C1F_4E83_A2D5_8B3F6C0E1D72 */

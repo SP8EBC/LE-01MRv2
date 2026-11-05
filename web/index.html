@@ -1,0 +1,488 @@
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Odczyty LE-01MR</title>
+<!--
+  LE-01MR log viewer - static page, no build step.
+
+  Loads the CSV written by le-01mr (and uploaded with --sftp) and plots voltage, current,
+  active power, frequency and power factor on a shared, zoomable time axis.
+
+  The page never refreshes by itself. Data are downloaded once on load, and again only when
+  the "Reload" button is clicked.
+
+  For testing, the URL can be overridden with ?csv=<url>, or a local file can be opened with
+  the "Otwórz plik" button (needed when the page is opened from file://, where fetch() is blocked).
+-->
+<script>
+	// ===== CONFIGURATION ==========================================================================
+	// URL of the CSV file on the web server. A relative path is resolved against this page.
+	// The server must allow cross-origin requests (CORS) if the CSV is on a different host.
+	const CSV_URL = "https://example.net/le01mr/le01mr.csv";
+	// ==============================================================================================
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/echarts/5.5.0/echarts.min.js"></script>
+<style>
+	:root {
+		color-scheme: light;
+		--surface-0: #f4f4f2;
+		--surface-1: #fcfcfb;
+		--border: #e2e1dc;
+		--grid: #ecebe7;
+		--text-primary: #0b0b0b;
+		--text-secondary: #52514e;
+		--text-muted: #7a7974;
+		--series-1: #2a78d6;
+		--critical: #c62828;
+	}
+	@media (prefers-color-scheme: dark) {
+		:root:not([data-theme="light"]) {
+			color-scheme: dark;
+			--surface-0: #121211;
+			--surface-1: #1a1a19;
+			--border: #2e2e2c;
+			--grid: #262624;
+			--text-primary: #f0efec;
+			--text-secondary: #c3c2b7;
+			--text-muted: #8f8e88;
+			--series-1: #3987e5;
+			--critical: #ef6b6b;
+		}
+	}
+	:root[data-theme="dark"] {
+		color-scheme: dark;
+		--surface-0: #121211;
+		--surface-1: #1a1a19;
+		--border: #2e2e2c;
+		--grid: #262624;
+		--text-primary: #f0efec;
+		--text-secondary: #c3c2b7;
+		--text-muted: #8f8e88;
+		--series-1: #3987e5;
+		--critical: #ef6b6b;
+	}
+
+	* { box-sizing: border-box; }
+	body {
+		margin: 0;
+		background: var(--surface-0);
+		color: var(--text-primary);
+		font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+	}
+	main { max-width: 1400px; margin: 0 auto; padding: 16px; }
+
+	header {
+		display: flex; flex-wrap: wrap; gap: 8px 16px;
+		align-items: baseline; justify-content: space-between;
+		margin-bottom: 12px;
+	}
+	h1 { font-size: 18px; margin: 0; font-weight: 600; }
+	.source { color: var(--text-muted); font-size: 12px; word-break: break-all; }
+	.actions { display: flex; gap: 8px; align-items: center; }
+	button, .file-btn {
+		font: inherit; font-size: 13px;
+		padding: 6px 12px; border-radius: 6px;
+		border: 1px solid var(--border); background: var(--surface-1); color: var(--text-primary);
+		cursor: pointer;
+	}
+	button:hover, .file-btn:hover { border-color: var(--text-muted); }
+	.file-btn input { display: none; }
+
+	.tiles {
+		display: flex; flex-wrap: wrap; gap: 12px;
+		margin-bottom: 12px;
+	}
+	.tiles > .tile { flex: 1 1 auto; } /* sized to content, the rest of the row shared equally */
+	.tile {
+		background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px;
+		padding: 12px 16px;
+	}
+	.tile .label { color: var(--text-secondary); font-size: 12px; }
+	.tile .value { font-size: 26px; font-weight: 600; font-variant-numeric: tabular-nums; margin: 2px 0; }
+	.tile .value .unit { font-size: 15px; font-weight: 500; color: var(--text-secondary); margin-left: 4px; }
+	.tile .sub { color: var(--text-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+	.tile .split { display: flex; flex-wrap: wrap; gap: 8px 24px; }
+	.tile .split > div { flex: 1 1 auto; }
+	.tile .split > div + div { border-left: 1px solid var(--border); padding-left: 24px; }
+
+	.panel {
+		background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px;
+		padding: 8px 4px 4px;
+	}
+	.hint { color: var(--text-muted); font-size: 12px; padding: 0 12px 4px; }
+	#chart { width: 100%; height: 1180px; }
+
+	#status { padding: 24px; text-align: center; color: var(--text-secondary); }
+	#status.error { color: var(--critical); }
+	.hidden { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+	<header>
+		<div>
+			<h1>Licznik energii LE-01MR</h1>
+			<div class="source" id="source"></div>
+		</div>
+		<div class="actions">
+			<button id="reload" type="button" title="Pobierz ponownie plik CSV">Odśwież</button>
+			<label class="file-btn" title="Otwórz plik CSV z tego komputera">Otwórz plik<input id="file" type="file" accept=".csv,text/csv"></label>
+		</div>
+	</header>
+
+	<section class="tiles hidden" id="tiles">
+		<div class="tile">
+			<div class="label">Najnowszy odczyt</div>
+			<div class="value" id="t-last">–</div>
+			<div class="sub" id="t-last-sub"></div>
+		</div>
+		<div class="tile">
+			<div class="label">Ostatnie wskazanie pobranej energii czynnej</div>
+			<div class="value" id="t-energy">–</div>
+			<div class="sub" id="t-energy-sub"></div>
+		</div>
+		<div class="tile">
+			<div class="split">
+				<div>
+					<div class="label">Najwyższa moc czynna</div>
+					<div class="value" id="t-power">–</div>
+					<div class="sub" id="t-power-sub"></div>
+				</div>
+				<div>
+					<div class="label">Średnia moc czynna</div>
+					<div class="value" id="t-power-avg">–</div>
+					<div class="sub" id="t-power-avg-sub"></div>
+				</div>
+			</div>
+		</div>
+	</section>
+
+	<div id="status">Wczytywanie…</div>
+
+	<section class="panel hidden" id="panel">
+		<div class="hint">Kółko myszy lub gest szczypania: powiększenie osi czasu · przeciąganie: przewijanie · suwak na dole: wybór zakresu · dwuklik: cały zakres</div>
+		<div id="chart"></div>
+	</section>
+</main>
+
+<script>
+"use strict";
+
+// Columns to plot: matched against the CSV header by prefix, so a changed unit text does not break it.
+const PLOTS = [
+	{ prefix: "Active Power",     title: "Moc czynna",   unit: "W",  digits: 0 },
+	{ prefix: "Voltage",          title: "Napięcie",      unit: "V",  digits: 1 },
+	{ prefix: "Current",          title: "Prąd",         unit: "A",  digits: 3 },
+	{ prefix: "Frequency",        title: "Częstotliwość", unit: "Hz", digits: 2 },
+	{ prefix: "Power factor",     title: "Współczynnik mocy", unit: "",   digits: 2 },
+];
+const COL_TIMESTAMP = "Timestamp";
+const COL_UNIX      = "Unix time";
+const COL_ENERGY    = "Total consumed (imported) active energy";
+const COL_POWER     = "Active Power";
+
+const GRID_HEIGHT = 170; // px per plot
+const GRID_GAP    = 52;  // px between plots (room for the title)
+const GRID_TOP    = 36;
+
+const $ = (id) => document.getElementById(id);
+let chart = null;
+let lastData = null;
+
+function cssVar(name) {
+	return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+function setStatus(text, isError) {
+	const s = $("status");
+	s.textContent = text;
+	s.classList.toggle("error", !!isError);
+	s.classList.toggle("hidden", !text);
+}
+
+function findColumn(fields, prefix) {
+	return fields.find((f) => f === prefix || f.startsWith(prefix + " ")) ?? null;
+}
+
+// ----- data -------------------------------------------------------------------------------------
+
+function parseCsv(text) {
+	const res = Papa.parse(text, { header: true, skipEmptyLines: true, dynamicTyping: false });
+	const fields = res.meta.fields || [];
+	const colUnix = findColumn(fields, COL_UNIX);
+	if (!colUnix) throw new Error(`Brak kolumny "${COL_UNIX}" - czy to na pewno plik CSV z le-01mr?`);
+
+	const colTs     = findColumn(fields, COL_TIMESTAMP);
+	const colEnergy = findColumn(fields, COL_ENERGY);
+	const colPower  = findColumn(fields, COL_POWER);
+	const plotCols  = PLOTS.map((p) => findColumn(fields, p.prefix));
+
+	const rows = [];
+	for (const r of res.data) {
+		const t = Number(r[colUnix]);
+		if (!Number.isFinite(t) || t <= 0) continue; // a partially written last line, or a repeated header
+		rows.push({
+			t: t * 1000,
+			ts: colTs ? r[colTs] : "",
+			energy: colEnergy ? Number(r[colEnergy]) : NaN,
+			power: colPower ? Number(r[colPower]) : NaN,
+			values: plotCols.map((c) => (c ? Number(r[c]) : NaN)),
+		});
+	}
+	if (!rows.length) throw new Error("Plik CSV nie zawiera żadnych odczytów.");
+	rows.sort((a, b) => a.t - b.t); // appended files may be out of order after a clock change
+	return { rows, plotCols };
+}
+
+function computeSummary(rows) {
+	const last = rows[rows.length - 1];
+	let lastE = null, maxP = null, sumP = 0, countP = 0;
+	for (const r of rows) {
+		if (Number.isFinite(r.energy)) lastE = r; // rows are sorted by time
+		if (Number.isFinite(r.power)) {
+			if (!maxP || r.power > maxP.power) maxP = r;
+			sumP += r.power;
+			countP++;
+		}
+	}
+	// arithmetic mean of all readings in the file
+	const avgP = countP ? sumP / countP : null;
+	return { first: rows[0], last, lastE, maxP, avgP, countP };
+}
+
+// Series data with null inserted where readings are missing, so the line is broken instead of
+// drawing a straight segment over the time when the logger was not running.
+function buildSeries(rows, idx) {
+	const dts = [];
+	for (let i = 1; i < rows.length; i++) dts.push(rows[i].t - rows[i - 1].t);
+	dts.sort((a, b) => a - b);
+	const median = dts.length ? dts[Math.floor(dts.length / 2)] : 1000;
+	const gapLimit = Math.max(10000, median * 5);
+
+	const out = [];
+	for (let i = 0; i < rows.length; i++) {
+		if (i > 0 && rows[i].t - rows[i - 1].t > gapLimit) out.push([rows[i - 1].t + 1, null]);
+		const v = rows[i].values[idx];
+		out.push([rows[i].t, Number.isFinite(v) ? v : null]);
+	}
+	return out;
+}
+
+// ----- rendering --------------------------------------------------------------------------------
+
+function fmtTime(ms) {
+	const d = new Date(ms);
+	const p = (n) => String(n).padStart(2, "0");
+	return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+// numbers in Polish notation: decimal comma, space as thousands separator
+function fmtNum(v, digits) {
+	const o = digits == null ? { maximumFractionDigits: 6 } : { minimumFractionDigits: digits, maximumFractionDigits: digits };
+	return v.toLocaleString("pl-PL", o);
+}
+
+// Polish plural form: 1 odczyt, 2-4 odczyty, 5+ odczytów (12-14 also odczytów)
+function plural(n, one, few, many) {
+	if (n === 1) return one;
+	const d = n % 10, dd = n % 100;
+	return d >= 2 && d <= 4 && (dd < 12 || dd > 14) ? few : many;
+}
+
+function fmtDuration(ms) {
+	const s = Math.round(ms / 1000);
+	const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+	if (d) return `${d} d ${h} h`;
+	if (h) return `${h} h ${m} min`;
+	return `${m} min ${s % 60} s`;
+}
+
+function renderTiles(rows) {
+	const s = computeSummary(rows);
+	$("t-last").textContent = s.last.ts || fmtTime(s.last.t);
+	$("t-last-sub").textContent =
+		`${fmtNum(rows.length)} ${plural(rows.length, "odczyt", "odczyty", "odczytów")} w ciągu ${fmtDuration(s.last.t - s.first.t)}, od ${s.first.ts || fmtTime(s.first.t)}`;
+
+	if (s.lastE) {
+		$("t-energy").innerHTML = `${fmtNum(s.lastE.energy, 2)}<span class="unit">kWh</span>`;
+		$("t-energy-sub").textContent = `odczyt z: ${s.lastE.ts || fmtTime(s.lastE.t)}`;
+	} else {
+		$("t-energy").textContent = "b.d.";
+		$("t-energy-sub").textContent = "brak kolumny w pliku";
+	}
+	if (s.maxP) {
+		$("t-power").innerHTML = `${fmtNum(s.maxP.power)}<span class="unit">W</span>`;
+		$("t-power-sub").textContent = `zmierzona: ${s.maxP.ts || fmtTime(s.maxP.t)}`;
+	} else {
+		$("t-power").textContent = "b.d.";
+		$("t-power-sub").textContent = "brak kolumny w pliku";
+	}
+	if (s.avgP != null) {
+		$("t-power-avg").innerHTML = `${fmtNum(s.avgP, 1)}<span class="unit">W</span>`;
+		$("t-power-avg-sub").textContent =
+			`z ${fmtNum(s.countP)} ${plural(s.countP, "odczytu", "odczytów", "odczytów")}`;
+	} else {
+		$("t-power-avg").textContent = "b.d.";
+		$("t-power-avg-sub").textContent = "brak kolumny w pliku";
+	}
+	$("tiles").classList.remove("hidden");
+}
+
+function buildOption(data) {
+	const c = {
+		series: cssVar("--series-1"), text: cssVar("--text-primary"), text2: cssVar("--text-secondary"),
+		muted: cssVar("--text-muted"), grid: cssVar("--grid"), border: cssVar("--border"),
+		surface: cssVar("--surface-1"),
+	};
+	const n = PLOTS.length;
+	const xIdx = PLOTS.map((_, i) => i);
+	const top = (i) => GRID_TOP + i * (GRID_HEIGHT + GRID_GAP);
+
+	const option = {
+		animation: false,
+		backgroundColor: "transparent",
+		textStyle: { fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif" },
+		title: PLOTS.map((p, i) => ({
+			text: p.unit ? `${p.title} [${p.unit}]` : p.title,
+			left: 12, top: top(i) - 30,
+			textStyle: { fontSize: 13, fontWeight: 600, color: c.text },
+		})),
+		grid: PLOTS.map((_, i) => ({ left: 64, right: 24, top: top(i), height: GRID_HEIGHT })),
+		axisPointer: { link: [{ xAxisIndex: "all" }], lineStyle: { color: c.muted }, label: { backgroundColor: c.text2 } },
+		tooltip: {
+			trigger: "axis",
+			backgroundColor: c.surface, borderColor: c.border, textStyle: { color: c.text, fontSize: 12 },
+			axisPointer: { type: "line" },
+			formatter: (params) => {
+				if (!params.length) return "";
+				const p = params[0];
+				const def = PLOTS[p.seriesIndex];
+				const v = p.value[1];
+				const val = v == null ? "brak danych" : `${fmtNum(v, def.digits)} ${def.unit}`;
+				return `<div style="color:${c.text2}">${fmtTime(p.value[0])}</div>` +
+					`${p.marker}${def.title}: <b>${val}</b>`;
+			},
+		},
+		xAxis: PLOTS.map((_, i) => ({
+			type: "time", gridIndex: i,
+			axisLine: { lineStyle: { color: c.border } },
+			axisTick: { lineStyle: { color: c.border } },
+			axisLabel: { color: c.muted, fontSize: 11, hideOverlap: true },
+			splitLine: { show: true, lineStyle: { color: c.grid } },
+		})),
+		yAxis: PLOTS.map((p, i) => ({
+			type: "value", gridIndex: i, scale: true,
+			axisLabel: { color: c.muted, fontSize: 11, formatter: (v) => fmtNum(v) },
+			splitLine: { lineStyle: { color: c.grid } },
+			splitNumber: 4,
+		})),
+		dataZoom: [
+			{ type: "inside", xAxisIndex: xIdx, filterMode: "none", zoomOnMouseWheel: true, moveOnMouseMove: true },
+			{
+				type: "slider", xAxisIndex: xIdx, filterMode: "none",
+				left: 64, right: 24, bottom: 12, height: 28,
+				borderColor: c.border, textStyle: { color: c.muted },
+				fillerColor: "rgba(127,127,127,0.15)",
+				dataBackground: { lineStyle: { color: c.muted }, areaStyle: { color: c.grid } },
+				labelFormatter: (v) => fmtTime(v),
+			},
+		],
+		series: PLOTS.map((p, i) => ({
+			name: p.title, type: "line", xAxisIndex: i, yAxisIndex: i,
+			data: data.plotCols[i] ? buildSeries(data.rows, i) : [],
+			showSymbol: false, symbolSize: 8,
+			sampling: "lttb", connectNulls: false,
+			lineStyle: { width: 2, color: c.series },
+			itemStyle: { color: c.series },
+			emphasis: { disabled: true },
+		})),
+	};
+	return { option, height: GRID_TOP + n * (GRID_HEIGHT + GRID_GAP) + 40 };
+}
+
+function renderChart(data, keepZoom) {
+	const el = $("chart");
+	$("panel").classList.remove("hidden");
+	const { option, height } = buildOption(data);
+	el.style.height = height + "px";
+
+	let zoom = null;
+	if (chart && keepZoom) {
+		const dz = chart.getOption().dataZoom?.[0];
+		if (dz) zoom = { start: dz.start, end: dz.end };
+	}
+	if (!chart) {
+		chart = echarts.init(el, null, { renderer: "canvas" });
+		window.addEventListener("resize", () => chart.resize());
+		el.addEventListener("dblclick", () => chart.dispatchAction({ type: "dataZoom", start: 0, end: 100 }));
+	}
+	chart.resize();
+	chart.setOption(option, true);
+	if (zoom) chart.dispatchAction({ type: "dataZoom", start: zoom.start, end: zoom.end });
+}
+
+function show(text, sourceLabel, keepZoom) {
+	const data = parseCsv(text);
+	lastData = data;
+	$("source").textContent = sourceLabel;
+	renderTiles(data.rows);
+	renderChart(data, keepZoom);
+	setStatus("");
+}
+
+// ----- loading ----------------------------------------------------------------------------------
+
+function csvUrl() {
+	const override = new URLSearchParams(location.search).get("csv");
+	return new URL(override || CSV_URL, location.href).href;
+}
+
+async function loadRemote(keepZoom) {
+	const url = csvUrl();
+	const btn = $("reload");
+	btn.disabled = true;
+	if (!lastData) setStatus("Wczytywanie " + url + " …");
+	try {
+		// "no-cache" = revalidate with the server; an unchanged file is answered with a short 304.
+		const resp = await fetch(url, { cache: "no-cache" });
+		if (!resp.ok) throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
+		const text = await resp.text();
+		show(text, `${url} · pobrano ${fmtTime(Date.now())}`, keepZoom);
+	} catch (e) {
+		let msg = `Nie można wczytać ${url}: ${e.message}`;
+		if (location.protocol === "file:") msg += " - strona otwarta z file:// nie może pobierać plików, użyj przycisku \"Otwórz plik\" albo udostępnij stronę przez HTTP.";
+		else if (e instanceof TypeError) msg += " (błąd sieci albo serwer nie zezwala na zapytania CORS z tej strony)";
+		if (lastData) alert(msg); else setStatus(msg, true);
+	} finally {
+		btn.disabled = false;
+	}
+}
+
+$("reload").addEventListener("click", () => loadRemote(true));
+
+$("file").addEventListener("change", (ev) => {
+	const f = ev.target.files[0];
+	if (!f) return;
+	f.text().then((text) => {
+		try { show(text, `plik lokalny: ${f.name}`, false); }
+		catch (e) { setStatus(`${f.name}: ${e.message}`, true); }
+	});
+	ev.target.value = "";
+});
+
+// re-theme the plots when the OS switches between light and dark mode
+window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+	if (lastData) renderChart(lastData, true);
+});
+
+if (typeof echarts === "undefined" || typeof Papa === "undefined") {
+	setStatus("Nie udało się pobrać bibliotek JavaScript z cdnjs.cloudflare.com - sprawdź połączenie z internetem.", true);
+} else {
+	loadRemote(false);
+}
+</script>
+</body>
+</html>

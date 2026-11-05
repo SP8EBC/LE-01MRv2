@@ -177,6 +177,15 @@ int ConsoleUi::drawHeader (int y)
 		y++;
 		put (y, 1, "CSV: ", labelAttr);
 		put (y, 7, m_config.csvPath);
+
+		if (!m_sftpStatus.empty ()) {
+			y++;
+			put (y, 1, "SFTP:", labelAttr);
+			put (y,
+				 7,
+				 m_sftpStatus,
+				 m_sftpFailing ? colorAttr (m_colors, CP_RED, A_BOLD) : static_cast<int> (A_NORMAL));
+		}
 	}
 	y++;
 
@@ -206,6 +215,9 @@ int ConsoleUi::drawHeader (int y)
 	details += fmt::format ("reads: {} ok, {} failed", m_readsOk, m_readsFailed);
 	if (m_compact && m_lastReadFailed) {
 		details += "   " + m_lastError;
+	}
+	if (m_compact && m_sftpFailing) {
+		details += "   SFTP upload FAILED";
 	}
 	put (y, x, details);
 	y++;
@@ -403,7 +415,8 @@ void ConsoleUi::draw ()
 	// all sections with separators and headings need this many rows, including 3 log lines
 	constexpr int FULL_LAYOUT_ROWS = 1 + 4 + 1 + 8 + 1 + 13 + 1 + 4 + 1;
 	const int counterRows = m_cols >= 2 * COUNTER_COL_W + 4 ? 7 : 13;
-	m_compact = m_rows < FULL_LAYOUT_ROWS - 13 + counterRows;
+	const int sftpRows = m_sftpStatus.empty () ? 0 : 1;
+	m_compact = m_rows < FULL_LAYOUT_ROWS - 13 + counterRows + sftpRows;
 
 	werase (stdscr);
 

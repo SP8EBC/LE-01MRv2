@@ -11,6 +11,9 @@
 #include "console_ui.hpp"
 #include "csv_writer.hpp"
 #include "le01mr.hpp"
+#include "sftp_uploader.hpp"
+#include <curl/curl.h>
+#include <filesystem>
 #include "serial_io_libmodbus.hpp"
 #include "serial_io_raw.hpp"
 
@@ -55,6 +58,9 @@ struct AppConfig {
 
 	std::string outputFileName;
 	double csvMaxSizeMb = 5.0;
+	std::string sftpTarget;
+	std::string sftpKey;
+	double sftpIntervalMin = 10.0;
 	double intervalS = 1.0;
 	unsigned timeoutMs = 1000;
 	le01mr::ReadMode readMode = le01mr::ReadMode::Auto;
@@ -147,6 +153,26 @@ AppConfig parseArgs (int argc, char *argv[])
 								   "first)");
 
 	// ----------------
+	// SFTP OPTIONS
+	// ----------------
+	po::options_description sftpOptions ("SFTP Upload Options");
+	sftpOptions.add_options () (
+		"sftp",
+		po::value<std::string> (&config.sftpTarget),
+		" : Upload the CSV file to this remote directory: [user@]host[:port][/path], e.g. "
+		"example.net/directory1/directory2. The path is absolute, use ~/dir for a directory in "
+		"the remote home. Existing remote files are overwritten. Authentication with ssh-agent or "
+		"keys from ~/.ssh, the host must be in ~/.ssh/known_hosts");
+	sftpOptions.add_options () (
+		"sftp-interval",
+		po::value<double> (&config.sftpIntervalMin)->default_value (10.0),
+		" : Interval between uploads in minutes. The file is also uploaded before it is rotated "
+		"and when the application exits");
+	sftpOptions.add_options () ("sftp-key",
+								po::value<std::string> (&config.sftpKey),
+								" : Private key file used instead of ssh-agent and default keys");
+
+	// ----------------
 	// DISPLAY OPTIONS
 	// ----------------
 	po::options_description displayOptions ("Display Options");
@@ -195,7 +221,11 @@ AppConfig parseArgs (int argc, char *argv[])
 							   " : Skips specified number of bytes from the begining of a response.");
 
 	po::options_description optionsDescription ("");
-	optionsDescription.add (generalOptions).add (displayOptions).add (rtsOptions).add (rawOptions);
+	optionsDescription.add (generalOptions)
+		.add (sftpOptions)
+		.add (displayOptions)
+		.add (rtsOptions)
+		.add (rawOptions);
 
 	// PARSING
 	po::variables_map vm;
@@ -243,6 +273,10 @@ AppConfig parseArgs (int argc, char *argv[])
 	}
 	else {
 		exitWithUsage (optionsDescription, "Read mode must be one of: auto, block, grouped", -2);
+	}
+
+	if (config.sftpIntervalMin < 0.1) {
+		exitWithUsage (optionsDescription, "sftp-interval must be at least 0.1 minute", -2);
 	}
 
 	if (config.csvMaxSizeMb < 0.0) {
@@ -395,6 +429,30 @@ int main (int argc, char *argv[])
 	}
 	SPDLOG_INFO ("Readings are stored in: {}", csv->path ());
 
+	// optional upload of the CSV file to a remote server
+	std::unique_ptr<SftpUploader> uploader;
+	const auto sftpInterval = std::chrono::duration_cast<std::chrono::steady_clock::duration> (
+		std::chrono::duration<double, std::ratio<60>> (config.sftpIntervalMin));
+	auto nextUpload = std::chrono::steady_clock::now () + sftpInterval;
+
+	if (!config.sftpTarget.empty ()) {
+		curl_global_init (CURL_GLOBAL_DEFAULT);
+		try {
+			uploader = std::make_unique<SftpUploader> (config.sftpTarget, config.sftpKey);
+		}
+		catch (const std::exception &ex) {
+			SPDLOG_ERROR ("{}", ex.what ());
+			return -1;
+		}
+
+		// the last version of a file is uploaded before it is closed by the rotation
+		csv->setRotationCallback ([&uploader] (const std::string &path,
+											   std::uintmax_t size,
+											   const std::string &finalName) {
+			uploader->upload (path, size, finalName, true);
+		});
+	}
+
 	le01mr::Meter meter{*io,
 						static_cast<uint8_t> (config.slaveId),
 						config.readMode,
@@ -454,6 +512,14 @@ int main (int argc, char *argv[])
 			if (ui) {
 				ui->setCsvPath (csv->path ()); // changes when the file is rotated
 			}
+
+			if (uploader && std::chrono::steady_clock::now () >= nextUpload) {
+				nextUpload = std::chrono::steady_clock::now () + sftpInterval;
+				uploader->upload (csv->path (),
+								  csv->size (),
+								  std::filesystem::path (csv->path ()).filename ().string (),
+								  false);
+			}
 		}
 		catch (const std::exception &ex) {
 			if (stopRequested != 0) {
@@ -469,6 +535,9 @@ int main (int argc, char *argv[])
 		// polled at least once per cycle, even if communication took longer than the interval
 		while (stopRequested == 0) {
 			if (ui) {
+				if (uploader) {
+					ui->setSftpStatus (uploader->status (), uploader->failing ());
+				}
 				ui->draw ();
 			}
 
@@ -503,6 +572,19 @@ int main (int argc, char *argv[])
 	if (ui) {
 		ui.reset ();
 		distSink->add_sink (consoleSink);
+	}
+
+	if (uploader) {
+		SPDLOG_INFO ("SFTP: uploading the final version of {}", csv->path ());
+		uploader->upload (csv->path (),
+						  csv->size (),
+						  std::filesystem::path (csv->path ()).filename ().string (),
+						  true);
+		if (!uploader->finish (std::chrono::seconds (60))) {
+			SPDLOG_ERROR ("SFTP: not all uploads finished in time");
+		}
+		uploader.reset ();
+		curl_global_cleanup ();
 	}
 
 	SPDLOG_INFO ("Finished, {} readings stored in {}", rowsStored, csv->path ());
